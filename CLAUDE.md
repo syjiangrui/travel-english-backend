@@ -1,0 +1,184 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Build & Run Commands
+
+```bash
+# 启动后台服务 (默认端口 8080)
+go run .
+
+# 运行测试 (mock 模式，不需要 API key)
+go test ./test/ -v
+
+# 运行集成测试 (需要 .env 中的真实 API key)
+go test ./test/ -tags=integration -v
+
+# 手动 WebSocket 调试
+go run . &
+wscat -c ws://localhost:8080/ws
+```
+
+## Architecture
+
+Go 后台服务，替代火山引擎 S2S 直连，串联 ElevenLabs STT → OpenRouter LLM (streaming) → ElevenLabs TTS。Flutter 客户端只连此后台 WebSocket，API key 全部收归后台管理。
+
+### 文件结构
+
+```
+travel-english-backend/
+├── main.go                   // HTTP server: /ws (WebSocket) + /health
+├── config/config.go          // 环境变量加载 (.env → Config struct)
+├── ws/
+│   ├── handler.go            // WebSocket upgrade + read loop (text/binary 路由)
+│   ├── session.go            // 会话状态 + 消息路由 + pipeline 编排 (核心)
+│   └── protocol.go           // JSON 消息类型定义 (ClientMessage/ServerMessage)
+├── stt/elevenlabs.go         // ElevenLabs STT: 实时 WebSocket + batch REST fallback
+├── llm/
+│   ├── openrouter.go         // OpenRouter SSE streaming (OpenAI 兼容格式)
+│   └── context.go            // 对话历史管理 (max 40 条, 自动 trim)
+├── tts/
+│   ├── elevenlabs.go         // ElevenLabs TTS: POST → MP3 bytes
+│   └── sentence_splitter.go  // 句子边界检测 (.!?。！？) → 分句给 TTS
+├── test/
+│   └── ws_integration_test.go // WebSocket 集成测试 (6 个测试用例)
+├── .env                      // 真实 API keys (不入 git)
+└── .env.example              // 配置模板
+```
+
+### 核心 Pipeline (session.go → streamLLMWithTTS)
+
+```
+Client PCM → ElevenLabs Realtime STT (WebSocket)
+         → asr.result (partial + final)
+         → OpenRouter SSE stream
+         → chat.delta 逐 token 转发客户端
+         → SentenceSplitter 按句拆分
+         → goroutine: 每句 → ElevenLabsTTS.Synthesize() → MP3 binary frame
+         → chat.done + tts.end
+```
+
+LLM streaming 和 TTS 合成**并行**：goroutine 从 `sentenceCh` channel 消费完整句子，边生成边发。
+
+### Mock/Live 双模式
+
+- **Live 模式**: `.env` 中配置了 `ELEVENLABS_API_KEY` + `OPENROUTER_API_KEY` 时自动启用
+- **Mock 模式**: 无 API key 时返回固定 mock 响应（`mockAudioEnd/mockTextQuery/sendMockTTS`），用于测试协议正确性
+- STT 实时 WebSocket 断线后自动 fallback 到 batch REST API（`handleAudioEnd` 中的 `batchFallback` label）
+
+## WebSocket 协议
+
+WebSocket 原生帧类型区分：Text frame = JSON 控制消息，Binary frame = 音频数据。
+
+### Client → Server
+
+| type | 说明 | 额外字段 |
+|------|------|---------|
+| `session.start` | 建立会话，初始化 STT/Context | `config: {system_role, speaking_style, tts_voice_id, stt_language}` |
+| *(binary frame)* | PCM 音频块 (16kHz 16bit mono) | 服务端实时转发给 ElevenLabs STT |
+| `audio.end` | 录音结束，commit STT → 触发 LLM→TTS 链 | — |
+| `text.query` | 文本输入 (跳过 STT，直接进 LLM) | `text` |
+| `tts.synthesize` | 纯 TTS 请求 (问候/消息重播) | `text` |
+| `conversation.history` | 注入历史上下文到 ContextManager | `items: [{role, text}]` |
+| `session.end` | 结束会话，关闭 STT WebSocket | — |
+
+### Server → Client
+
+| type | 说明 | 额外字段 |
+|------|------|---------|
+| `session.started` | 会话就绪 | `session_id` |
+| `asr.result` | 语音识别结果 | `text, is_final` (partial: false, final: true) |
+| `chat.delta` | LLM 流式 token | `text` (增量) |
+| `chat.done` | LLM 完成 | — |
+| `tts.start` | TTS 音频即将发送 | — |
+| *(binary frame)* | MP3 音频块 (按句发送) | — |
+| `tts.end` | TTS 全部发送完毕 | — |
+| `error` | 错误 | `code, message` |
+
+## 关键类型与方法
+
+### config.Config
+```go
+Port, ElevenLabsKey, OpenRouterKey, DefaultModel, DefaultVoiceID
+```
+环境变量名: `PORT`, `ELEVENLABS_API_KEY`, `OPENROUTER_API_KEY`, `DEFAULT_MODEL`, `DEFAULT_VOICE_ID`
+
+### ws.Session (核心状态机)
+```
+sendJSON(v) / sendBinary(data)     // 线程安全写入 (mu sync.Mutex)
+HandleMessage(raw) / HandleBinary(data)  // 读 loop 路由
+handleSessionStart → connectSTT    // 初始化 + 连接实时 STT
+handleAudioEnd → streamLLMWithTTS  // 核心 pipeline
+handleTextQuery → streamLLMWithTTS // 文本输入路径
+handleTTSSynthesize                // 独立 TTS 请求
+isLive()                           // API key 是否配置
+```
+
+### stt.RealtimeSTT (实时 WebSocket STT)
+```
+Connect(ctx, language)   // 连接 ElevenLabs realtime endpoint
+SendAudio(pcm []byte)    // base64 编码发送 PCM 块
+Commit()                 // 提交当前语音段，等待 committed_transcript
+Close()                  // 关闭 WebSocket
+OnPartial / OnCommitted / OnError  // 回调
+```
+
+### stt.ElevenLabsSTT (批量 REST STT, fallback)
+```
+Transcribe(ctx, pcmAudio) → text  // multipart POST, 自动加 WAV header
+```
+
+### llm.OpenRouterLLM
+```
+StreamChat(ctx, messages, onDelta) → (fullResponse, err)
+// SSE 解析, OpenAI 兼容格式, 累积完整回复
+```
+
+### llm.ContextManager
+```
+AddUserMessage(text) / AddAssistantMessage(text)  // 自动 trim 到 40 条
+SetHistory(items) / BuildMessages(userText)
+```
+
+### tts.ElevenLabsTTS
+```
+Synthesize(ctx, text) → mp3Bytes  // eleven_multilingual_v2 模型
+```
+
+### tts.SentenceSplitter
+```
+Feed(delta)  // 缓冲 token, 句子边界时触发 OnSentence 回调
+Flush()      // 发送剩余缓冲文本
+// 边界: ". " "! " "? " ".\n" "!\n" "?\n" "。" "！" "？"
+```
+
+## 默认配置
+
+| 配置项 | 默认值 |
+|--------|--------|
+| Port | 8080 |
+| LLM Model | deepseek/deepseek-chat-v3.1 |
+| TTS Voice | 21m00Tcm4TlvDq8ikWAM (Rachel) |
+| TTS Model | eleven_multilingual_v2 |
+| STT Model | scribe_v2_realtime |
+| 音频格式 | PCM 16kHz 16-bit mono (输入) / MP3 (输出) |
+| 上下文上限 | 40 条消息 (20 轮 QA) |
+| STT 超时 | commit 10s, batch 30s |
+| LLM 超时 | 60s |
+
+## 测试
+
+6 个测试用例 (mock 模式, 不需要 API key):
+1. `TestHealthEndpoint` — /health 返回 200
+2. `TestSessionLifecycle` — session.start → session.ended
+3. `TestAudioEndMockPipeline` — binary audio → asr.result → chat.delta × N → chat.done → tts.start → binary → tts.end
+4. `TestTextQuery` — text.query → chat.delta × N → chat.done → tts
+5. `TestTtsSynthesize` — tts.synthesize → tts.start → binary → tts.end
+6. `TestConversationHistory` — conversation.history 注入
+
+## 客户端配合
+
+Flutter 客户端通过 `BackendConversationService` (lib/services/backend_conversation_service.dart) 连接此后台：
+- 发送: JSON text frame + PCM binary frame
+- 接收: JSON 控制消息 + MP3 binary frame (队列逐句播放)
+- 后台换模型/换 TTS 引擎对客户端零影响
