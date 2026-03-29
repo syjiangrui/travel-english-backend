@@ -1,13 +1,15 @@
 package llm
 
-// ContextManager maintains conversation history for LLM calls.
+// ContextManager maintains a sliding window of conversation history for LLM calls.
+// It keeps at most MaxMessages entries (default 40 ≈ 20 QA pairs) to stay within
+// typical LLM context limits while preserving recent conversation flow.
 type ContextManager struct {
-	SystemRole  string
-	MaxMessages int // max total messages (default 40 = 20 QA pairs)
-	History     []Message
+	SystemRole  string    // system prompt injected at the start of every LLM request
+	MaxMessages int       // max total messages retained (default 40 = 20 QA pairs)
+	History     []Message // ordered conversation turns (user/assistant alternating)
 }
 
-// NewContextManager creates a new context manager.
+// NewContextManager creates a new context manager with the given system prompt.
 func NewContextManager(systemRole string) *ContextManager {
 	return &ContextManager{
 		SystemRole:  systemRole,
@@ -16,19 +18,21 @@ func NewContextManager(systemRole string) *ContextManager {
 	}
 }
 
-// AddUserMessage appends a user message.
+// AddUserMessage appends a user message and trims history if it exceeds MaxMessages.
 func (c *ContextManager) AddUserMessage(text string) {
 	c.History = append(c.History, Message{Role: "user", Content: text})
 	c.trim()
 }
 
-// AddAssistantMessage appends an assistant message.
+// AddAssistantMessage appends an assistant message and trims history if needed.
 func (c *ContextManager) AddAssistantMessage(text string) {
 	c.History = append(c.History, Message{Role: "assistant", Content: text})
 	c.trim()
 }
 
-// SetHistory replaces the history with injected context.
+// SetHistory replaces the current history with injected conversation context,
+// typically from the Flutter client's persisted chat history on reconnect.
+// "teacher" role is normalized to "assistant" for OpenAI API compatibility.
 func (c *ContextManager) SetHistory(items []struct{ Role, Text string }) {
 	c.History = make([]Message, 0, len(items))
 	for _, item := range items {
@@ -41,7 +45,10 @@ func (c *ContextManager) SetHistory(items []struct{ Role, Text string }) {
 	c.trim()
 }
 
-// BuildMessages returns the full message list for LLM, including system prompt.
+// BuildMessages returns the complete message list for an LLM request, including
+// the system prompt, conversation history, and the new user message.
+// Note: this appends userText as a new message without adding it to History —
+// use AddUserMessage first if the message should be persisted in context.
 func (c *ContextManager) BuildMessages(userText string) []Message {
 	msgs := make([]Message, 0, 2+len(c.History))
 	if c.SystemRole != "" {
@@ -52,6 +59,8 @@ func (c *ContextManager) BuildMessages(userText string) []Message {
 	return msgs
 }
 
+// trim drops the oldest messages when History exceeds MaxMessages,
+// keeping only the most recent entries for context window management.
 func (c *ContextManager) trim() {
 	max := c.MaxMessages
 	if max <= 0 {

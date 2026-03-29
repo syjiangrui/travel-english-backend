@@ -2,23 +2,31 @@ package tts
 
 import "strings"
 
-// SentenceSplitter buffers LLM delta tokens and emits complete sentences.
+// SentenceSplitter buffers streaming LLM delta tokens and emits complete sentences
+// for TTS synthesis. It recognizes sentence boundaries at punctuation followed by
+// whitespace (English: ". ", "! ", "? ") or CJK sentence-ending punctuation
+// (Chinese: "。", "！", "？"). This allows TTS to begin synthesizing the first
+// sentence while the LLM is still generating subsequent ones.
 type SentenceSplitter struct {
 	buffer     strings.Builder
-	OnSentence func(string) // called when a complete sentence is detected
+	OnSentence func(string) // called with each complete sentence
 }
 
-// NewSentenceSplitter creates a new splitter with the given callback.
+// NewSentenceSplitter creates a splitter that calls onSentence for each detected sentence.
 func NewSentenceSplitter(onSentence func(string)) *SentenceSplitter {
 	return &SentenceSplitter{OnSentence: onSentence}
 }
 
-// Feed adds a delta token and checks for sentence boundaries.
+// Feed adds a delta token to the buffer and checks for sentence boundaries.
+// When a boundary is found, all complete sentences up to that point are emitted
+// and the remainder stays in the buffer for the next Feed call.
 func (s *SentenceSplitter) Feed(delta string) {
 	s.buffer.WriteString(delta)
 	text := s.buffer.String()
 
-	// Find the last sentence boundary
+	// Scan for the last sentence boundary in the accumulated buffer.
+	// Using LastIndex (not first) ensures we emit as much complete text as possible
+	// in a single callback, reducing the number of TTS API calls.
 	lastIdx := -1
 	for _, ender := range []string{". ", "! ", "? ", ".\n", "!\n", "?\n", "。", "！", "？"} {
 		if idx := strings.LastIndex(text, ender); idx > lastIdx {

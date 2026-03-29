@@ -18,20 +18,25 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Session represents a single WebSocket conversation session. It owns the
+// connection, manages STT/LLM/TTS lifecycle, and maintains conversation context.
+// All writes to the WebSocket are serialized through mu to prevent interleaving.
 type Session struct {
 	ID         string
 	conn       *websocket.Conn
 	cfg        *config.Config
-	mu         sync.Mutex
-	sessionCfg *SessionConfig
+	mu         sync.Mutex     // guards all conn writes (sendJSON/sendBinary)
+	sessionCfg *SessionConfig // client-provided session configuration
 	ctx        *llm.ContextManager
 
-	// Streaming STT
-	sttConn     *stt.RealtimeSTT
-	sttReady    bool
-	audioBuffer [][]byte // fallback buffer for mock mode
+	// Streaming STT state
+	sttConn     *stt.RealtimeSTT // nil when not connected or in batch mode
+	sttReady    bool             // false after first send error to suppress repeated logging
+	audioBuffer [][]byte         // accumulates PCM chunks for batch fallback or mock mode
 }
 
+// NewSession creates a session bound to the given WebSocket connection.
+// The session starts in an uninitialized state — call handleSessionStart to assign an ID.
 func NewSession(conn *websocket.Conn, cfg *config.Config) *Session {
 	return &Session{
 		conn:        conn,
@@ -40,35 +45,42 @@ func NewSession(conn *websocket.Conn, cfg *config.Config) *Session {
 	}
 }
 
+// isLive returns true when both ElevenLabs and OpenRouter API keys are configured,
+// meaning the session can use real STT/LLM/TTS services. Otherwise mock mode is used.
 func (s *Session) isLive() bool {
 	return s.cfg != nil && s.cfg.ElevenLabsKey != "" && s.cfg.OpenRouterKey != ""
 }
 
 // isBatchSTT returns true when the client requested batch (non-streaming) STT mode.
+// In batch mode, all audio is buffered locally and sent to the REST API at audio.end.
 func (s *Session) isBatchSTT() bool {
 	return s.sessionCfg != nil && s.sessionCfg.STTMode == "batch"
 }
 
-// sendJSON writes a JSON text frame, protected by mutex.
+// sendJSON marshals v as JSON and writes it as a text frame.
+// Thread-safe: serialized by mu to prevent frame interleaving from concurrent goroutines.
 func (s *Session) sendJSON(v interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conn.WriteJSON(v)
 }
 
-// sendBinary writes a binary frame, protected by mutex.
+// sendBinary writes raw bytes as a binary frame. Thread-safe via mu.
 func (s *Session) sendBinary(data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
+// logf logs a formatted message with the session ID prefix for correlation.
 func (s *Session) logf(format string, args ...interface{}) {
 	prefix := fmt.Sprintf("[WS] session %s: ", s.ID)
 	log.Printf(prefix+format, args...)
 }
 
-// HandleMessage routes a JSON text message.
+// HandleMessage parses a JSON text frame and dispatches to the appropriate handler.
+// Long-running handlers (audio.end, text.query, tts.synthesize) run in separate
+// goroutines so the read loop is not blocked.
 func (s *Session) HandleMessage(raw []byte) {
 	var msg ClientMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -95,10 +107,11 @@ func (s *Session) HandleMessage(raw []byte) {
 	}
 }
 
-// HandleBinary processes incoming audio data.
-// In batch STT mode: always buffer locally (no realtime forwarding).
-// In realtime mode with live STT: forward to ElevenLabs STT WebSocket + buffer as fallback.
-// In mock mode: buffer locally.
+// HandleBinary processes an incoming PCM audio chunk (16 kHz, 16-bit, mono).
+//
+// Audio is always buffered locally for batch STT fallback. In realtime mode,
+// chunks are also forwarded to the ElevenLabs streaming STT WebSocket.
+// After the first forward error, further errors are suppressed to avoid log spam.
 func (s *Session) HandleBinary(data []byte) {
 	// Always buffer audio for batch mode or as fallback
 	s.audioBuffer = append(s.audioBuffer, data)
@@ -117,6 +130,8 @@ func (s *Session) HandleBinary(data []byte) {
 
 // --- handlers ---
 
+// handleSessionStart initializes the session: assigns an ID, stores config,
+// creates the LLM context manager, and optionally opens a streaming STT connection.
 func (s *Session) handleSessionStart(msg ClientMessage) {
 	if msg.SessionID != "" {
 		s.ID = msg.SessionID
@@ -185,6 +200,14 @@ func (s *Session) connectSTT() {
 	s.sttReady = true
 }
 
+// handleAudioEnd processes the end of a user's audio recording. It follows a
+// tiered strategy:
+//  1. Realtime STT: commit the streaming transcript (preferred, lowest latency)
+//  2. Batch STT fallback: send buffered PCM to the REST API (used when realtime
+//     fails, times out, or when batch mode is explicitly requested)
+//  3. Mock mode: return canned responses for testing without API keys
+//
+// After obtaining the transcript, it feeds it to the LLM → TTS pipeline.
 func (s *Session) handleAudioEnd() {
 	if !s.isLive() {
 		// Mock mode: use buffered audio
@@ -203,7 +226,9 @@ func (s *Session) handleAudioEnd() {
 	if s.sttConn != nil && s.sttConn.IsConnected() {
 		s.logf("audio.end: committing streaming STT")
 
-		// Set up channel to receive committed transcript
+		// Set up a one-shot channel to bridge the async OnCommitted callback
+		// to this synchronous flow. The channel is buffered(1) so the callback
+		// never blocks even if we've already timed out.
 		committedCh := make(chan string, 1)
 		s.sttConn.OnCommitted = func(text string) {
 			select {
@@ -276,6 +301,8 @@ batchFallback:
 	s.streamLLMWithTTS(text)
 }
 
+// handleTextQuery processes a direct text input (no STT needed).
+// In live mode it feeds the text to LLM → TTS; in mock mode returns canned responses.
 func (s *Session) handleTextQuery(text string) {
 	s.logf("text.query: %s", text)
 
@@ -288,6 +315,8 @@ func (s *Session) handleTextQuery(text string) {
 	s.streamLLMWithTTS(text)
 }
 
+// handleTTSSynthesize performs standalone text-to-speech without LLM involvement.
+// Used by the Flutter client for message replay and welcome greetings.
 func (s *Session) handleTTSSynthesize(text string) {
 	s.logf("tts.synthesize: %s", text)
 
@@ -315,6 +344,9 @@ func (s *Session) handleTTSSynthesize(text string) {
 	_ = s.sendJSON(ServerMessage{Type: "tts.end"})
 }
 
+// handleConversationHistory injects prior conversation turns into the LLM context,
+// allowing session continuity across reconnects. The Flutter client sends saved
+// messages; "teacher" role is normalized to "assistant" for OpenAI-compatible APIs.
 func (s *Session) handleConversationHistory(items []HistoryItem) {
 	if s.ctx == nil {
 		s.ctx = llm.NewContextManager("")
@@ -333,6 +365,8 @@ func (s *Session) handleConversationHistory(items []HistoryItem) {
 	s.logf("conversation.history: %d items injected", len(items))
 }
 
+// handleSessionEnd tears down the session: closes the STT WebSocket and
+// notifies the client. The main WebSocket connection remains open for potential reuse.
 func (s *Session) handleSessionEnd() {
 	// Close STT WebSocket if open
 	if s.sttConn != nil {
@@ -344,7 +378,15 @@ func (s *Session) handleSessionEnd() {
 	_ = s.sendJSON(ServerMessage{Type: "session.ended"})
 }
 
-// streamLLMWithTTS streams LLM response with parallel TTS sentence synthesis.
+// streamLLMWithTTS orchestrates the LLM → TTS pipeline with parallelism:
+//
+//  1. Streams LLM tokens to the client as chat.delta messages
+//  2. A SentenceSplitter accumulates tokens into complete sentences
+//  3. Each sentence is sent to ElevenLabs TTS in a parallel goroutine
+//  4. TTS MP3 binary frames are sent to the client as they become available
+//
+// This architecture minimizes time-to-first-audio: TTS synthesis begins as
+// soon as the first sentence is complete, without waiting for the full LLM response.
 func (s *Session) streamLLMWithTTS(userText string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -420,8 +462,9 @@ func (s *Session) streamLLMWithTTS(userText string) {
 	}
 }
 
-// --- mock fallbacks (same as Phase 1, for tests) ---
+// --- mock fallbacks (used when API keys are not configured, e.g., in tests) ---
 
+// mockAudioEnd simulates the STT → LLM → TTS pipeline with canned data.
 func (s *Session) mockAudioEnd() {
 	_ = s.sendJSON(ServerMessage{Type: "asr.result", Text: "Mock transcription of your audio", IsFinal: BoolPtr(true)})
 	s.streamChatDeltas([]string{"That's", " a", " great", " question!", " You", " can", " check", " in", " at", " counter", " 3."})
@@ -429,6 +472,7 @@ func (s *Session) mockAudioEnd() {
 	s.sendMockTTS()
 }
 
+// mockTextQuery simulates an LLM response for a text query in mock mode.
 func (s *Session) mockTextQuery(text string) {
 	response := fmt.Sprintf("I understand your question about: %s. Let me help you with that.", text)
 	tokens := tokenize(response)
@@ -437,6 +481,8 @@ func (s *Session) mockTextQuery(text string) {
 	s.sendMockTTS()
 }
 
+// streamChatDeltas sends tokens one at a time with a 50ms delay to simulate
+// the streaming behavior of a real LLM response.
 func (s *Session) streamChatDeltas(tokens []string) {
 	for _, tok := range tokens {
 		_ = s.sendJSON(ServerMessage{Type: "chat.delta", Text: tok})
@@ -444,6 +490,7 @@ func (s *Session) streamChatDeltas(tokens []string) {
 	}
 }
 
+// sendMockTTS sends a dummy TTS sequence (start → 1KB binary → end) for testing.
 func (s *Session) sendMockTTS() {
 	_ = s.sendJSON(ServerMessage{Type: "tts.start"})
 	dummyMP3 := make([]byte, 1024)
@@ -451,6 +498,8 @@ func (s *Session) sendMockTTS() {
 	_ = s.sendJSON(ServerMessage{Type: "tts.end"})
 }
 
+// tokenize splits a string into space-preserving tokens for mock streaming.
+// Each token retains its leading space (e.g., " hello") except the first word.
 func tokenize(s string) []string {
 	tokens := make([]string, 0)
 	current := ""

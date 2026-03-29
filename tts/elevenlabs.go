@@ -1,3 +1,5 @@
+// Package tts provides text-to-speech synthesis via ElevenLabs REST API
+// and a sentence splitter for streaming LLM-to-TTS pipelining.
 package tts
 
 import (
@@ -9,17 +11,21 @@ import (
 	"net/http"
 )
 
+// ElevenLabsTTS synthesizes speech from text using the ElevenLabs v1 API.
+// It returns MP3 audio bytes suitable for direct playback or WebSocket forwarding.
 type ElevenLabsTTS struct {
 	APIKey  string
-	VoiceID string
+	VoiceID string // ElevenLabs voice ID; defaults to "21m00Tcm4TlvDq8ikWAM" (Rachel)
 	BaseURL string // default "https://api.elevenlabs.io/v1"
 
-	// PreviousText provides context from the preceding sentence for natural prosody continuity.
+	// PreviousText provides context from the preceding sentence for natural prosody
+	// continuity across sentence boundaries. Updated automatically after each Synthesize call.
 	PreviousText string
 }
 
-// Synthesize converts text to MP3 audio bytes.
-// After each call, PreviousText is automatically updated to the synthesized text.
+// Synthesize converts text to MP3 audio bytes using ElevenLabs multilingual_v2 model.
+// After each successful call, PreviousText is updated to enable prosody continuity
+// when synthesizing the next sentence in a sequence.
 func (t *ElevenLabsTTS) Synthesize(ctx context.Context, text string) ([]byte, error) {
 	if text == "" {
 		return nil, fmt.Errorf("empty text")

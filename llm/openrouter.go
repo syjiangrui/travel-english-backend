@@ -1,3 +1,5 @@
+// Package llm provides LLM chat completion via OpenRouter's OpenAI-compatible API.
+// It supports streaming (SSE) responses for real-time token delivery to the client.
 package llm
 
 import (
@@ -11,20 +13,22 @@ import (
 	"strings"
 )
 
-// Message represents a chat message.
+// Message represents a single chat message in the OpenAI messages format.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string `json:"role"`    // "system", "user", or "assistant"
+	Content string `json:"content"` // message text
 }
 
+// OpenRouterLLM is a client for streaming chat completions via OpenRouter.
 type OpenRouterLLM struct {
 	APIKey  string
-	Model   string
+	Model   string // e.g., "deepseek/deepseek-chat-v3.1"
 	BaseURL string // default "https://openrouter.ai/api/v1"
 }
 
-// StreamChat sends messages to OpenRouter and streams delta tokens to onDelta callback.
+// StreamChat sends messages to OpenRouter and streams delta tokens via the onDelta callback.
 // Returns the full accumulated response text and any error.
+// max_tokens is set to 100 to keep replies short and conversational for the travel English use case.
 func (o *OpenRouterLLM) StreamChat(ctx context.Context, messages []Message, onDelta func(string)) (string, error) {
 	baseURL := o.BaseURL
 	if baseURL == "" {
@@ -61,7 +65,8 @@ func (o *OpenRouterLLM) StreamChat(ctx context.Context, messages []Message, onDe
 		return "", fmt.Errorf("LLM API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	// Parse SSE stream
+	// Parse SSE stream: each line starting with "data: " contains a JSON chunk.
+	// The stream terminates with "data: [DONE]".
 	var fullResponse strings.Builder
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {

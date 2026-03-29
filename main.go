@@ -1,3 +1,7 @@
+// Package main is the entry point for the travel-english-backend server.
+// It exposes two HTTP endpoints:
+//   - /ws      — WebSocket endpoint for real-time conversation (STT → LLM → TTS)
+//   - /health  — JSON health check for load balancers and monitoring
 package main
 
 import (

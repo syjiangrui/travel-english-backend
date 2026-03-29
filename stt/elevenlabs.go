@@ -1,3 +1,7 @@
+// Package stt provides speech-to-text integration with ElevenLabs.
+// It offers two modes:
+//   - RealtimeSTT: streaming WebSocket for low-latency partial + committed transcripts
+//   - ElevenLabsSTT: batch REST API for simpler use cases or as a fallback
 package stt
 
 import (
@@ -43,14 +47,16 @@ type RealtimeSTT struct {
 	closed bool
 }
 
-// sttServerMsg is the union of possible server messages.
-// ElevenLabs may return "error" as a string or object, so we use json.RawMessage.
+// sttServerMsg is the union of possible ElevenLabs server messages.
+// The "error" field can be either a string or an object, so json.RawMessage
+// is used and parsed separately in errorString().
 type sttServerMsg struct {
 	MessageType string          `json:"message_type"`
 	Text        string          `json:"text,omitempty"`
 	RawError    json.RawMessage `json:"error,omitempty"`
 }
 
+// errorString extracts a human-readable error message from the polymorphic error field.
 func (m *sttServerMsg) errorString() string {
 	if len(m.RawError) == 0 {
 		return ""
@@ -71,8 +77,13 @@ func (m *sttServerMsg) errorString() string {
 	return string(m.RawError)
 }
 
-// Connect opens the ElevenLabs realtime STT WebSocket.
+// Connect opens the ElevenLabs Scribe v2 realtime STT WebSocket.
 // language can be "" for auto-detect or an ISO 639-1 code like "en".
+// The connection uses manual commit strategy — call Commit() to finalize each utterance.
+//
+// Configuration: PCM 16kHz input, VAD threshold 0.5, 200ms min speech/silence duration.
+// NOTE: Connect waits 500ms after dial for session_started; a proper wait on the
+// session_started message would be more robust but adds complexity.
 func (r *RealtimeSTT) Connect(ctx context.Context, language string) error {
 	url := "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual&enable_logging=false" +
 		"&include_language_detection=true" +
@@ -164,6 +175,10 @@ func (r *RealtimeSTT) Close() {
 	log.Printf("[STT] WebSocket closed")
 }
 
+// readPump is the receive loop for the STT WebSocket. It runs in a dedicated
+// goroutine and dispatches events to the registered callbacks. On read error
+// (connection lost), it sets closed=true to prevent further sends and signals
+// completion via the done channel.
 func (r *RealtimeSTT) readPump() {
 	defer close(r.done)
 	for {
@@ -221,7 +236,9 @@ type ElevenLabsSTT struct {
 	BaseURL string // default "https://api.elevenlabs.io/v1"
 }
 
-// Transcribe converts raw PCM audio (16kHz, 16-bit, mono) to text.
+// Transcribe converts raw PCM audio (16 kHz, 16-bit, mono) to text using
+// the ElevenLabs batch REST API. The PCM data is wrapped in a WAV header
+// before upload since the API expects a standard audio file format.
 func (s *ElevenLabsSTT) Transcribe(ctx context.Context, pcmAudio []byte) (string, error) {
 	if len(pcmAudio) == 0 {
 		return "", fmt.Errorf("empty audio data")
@@ -273,7 +290,8 @@ func (s *ElevenLabsSTT) Transcribe(ctx context.Context, pcmAudio []byte) (string
 	return result.Text, nil
 }
 
-// addWAVHeader prepends a standard 44-byte RIFF/WAV header to raw PCM data.
+// addWAVHeader prepends a standard 44-byte RIFF/WAV header to raw PCM data,
+// producing a valid WAV file suitable for upload to REST APIs.
 func addWAVHeader(pcmData []byte, sampleRate, bitsPerSample, channels int) []byte {
 	dataSize := len(pcmData)
 	fileSize := 36 + dataSize
