@@ -27,8 +27,9 @@ Go 后台服务，替代火山引擎 S2S 直连，串联 ElevenLabs STT → Open
 
 ```
 travel-english-backend/
-├── main.go                   // HTTP server: /ws (WebSocket) + /health
+├── main.go                   // HTTP server: /ws (WebSocket) + /health + /hint (REST)
 ├── config/config.go          // 环境变量加载 (.env → Config struct)
+├── hint/handler.go           // POST /hint: 空闲引导提示 (LLM 生成上下文引导语)
 ├── ws/
 │   ├── handler.go            // WebSocket upgrade + read loop (text/binary 路由)
 │   ├── session.go            // 会话状态 + 消息路由 + pipeline 编排 (核心)

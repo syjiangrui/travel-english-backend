@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"travel-english-backend/config"
+	"travel-english-backend/hint"
 	"travel-english-backend/ws"
 )
 
@@ -17,6 +18,7 @@ func main() {
 	cfg := config.Load()
 
 	http.HandleFunc("/ws", ws.NewHandler(cfg))
+	http.HandleFunc("/hint", hint.HandleHint(cfg))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
