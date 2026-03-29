@@ -44,6 +44,11 @@ func (s *Session) isLive() bool {
 	return s.cfg != nil && s.cfg.ElevenLabsKey != "" && s.cfg.OpenRouterKey != ""
 }
 
+// isBatchSTT returns true when the client requested batch (non-streaming) STT mode.
+func (s *Session) isBatchSTT() bool {
+	return s.sessionCfg != nil && s.sessionCfg.STTMode == "batch"
+}
+
 // sendJSON writes a JSON text frame, protected by mutex.
 func (s *Session) sendJSON(v interface{}) error {
 	s.mu.Lock()
@@ -91,10 +96,15 @@ func (s *Session) HandleMessage(raw []byte) {
 }
 
 // HandleBinary processes incoming audio data.
-// In live mode: forward to ElevenLabs STT WebSocket in real-time.
+// In batch STT mode: always buffer locally (no realtime forwarding).
+// In realtime mode with live STT: forward to ElevenLabs STT WebSocket + buffer as fallback.
 // In mock mode: buffer locally.
 func (s *Session) HandleBinary(data []byte) {
-	if s.isLive() && s.sttConn != nil && s.sttConn.IsConnected() {
+	// Always buffer audio for batch mode or as fallback
+	s.audioBuffer = append(s.audioBuffer, data)
+
+	// In realtime mode, also forward to streaming STT
+	if !s.isBatchSTT() && s.isLive() && s.sttConn != nil && s.sttConn.IsConnected() {
 		if err := s.sttConn.SendAudio(data); err != nil {
 			// Only log once, not per-chunk
 			if s.sttReady {
@@ -102,8 +112,6 @@ func (s *Session) HandleBinary(data []byte) {
 				s.sttReady = false
 			}
 		}
-	} else {
-		s.audioBuffer = append(s.audioBuffer, data)
 	}
 }
 
@@ -125,12 +133,17 @@ func (s *Session) handleSessionStart(msg ClientMessage) {
 	s.ctx = llm.NewContextManager(systemRole)
 	s.logf("session.start config: systemRole=%q (len=%d)", systemRole, len(systemRole))
 
-	// Connect streaming STT if live
-	if s.isLive() {
+	// Connect streaming STT if live and not batch mode
+	if s.isLive() && !s.isBatchSTT() {
 		s.connectSTT()
 	}
 
-	s.logf("session started (live=%v, stt=%v)", s.isLive(), s.sttReady)
+	s.logf("session started (live=%v, stt=%v, sttMode=%s)", s.isLive(), s.sttReady, func() string {
+		if s.isBatchSTT() {
+			return "batch"
+		}
+		return "realtime"
+	}())
 	_ = s.sendJSON(ServerMessage{Type: "session.started", SessionID: s.ID})
 }
 
@@ -178,6 +191,12 @@ func (s *Session) handleAudioEnd() {
 		s.audioBuffer = s.audioBuffer[:0]
 		s.mockAudioEnd()
 		return
+	}
+
+	// Batch STT mode: skip realtime commit, go directly to batch REST API
+	if s.isBatchSTT() {
+		s.logf("audio.end: batch STT mode, using REST API")
+		goto batchFallback
 	}
 
 	// If streaming STT is connected, commit and wait for result

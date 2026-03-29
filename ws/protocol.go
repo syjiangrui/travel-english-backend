@@ -15,6 +15,7 @@ type SessionConfig struct {
 	SpeakingStyle string `json:"speaking_style,omitempty"`
 	TTSVoiceID    string `json:"tts_voice_id,omitempty"`
 	STTLanguage   string `json:"stt_language,omitempty"`
+	STTMode       string `json:"stt_mode,omitempty"` // "realtime" (default) or "batch"
 }
 
 type HistoryItem struct {
