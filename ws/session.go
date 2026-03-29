@@ -45,10 +45,14 @@ func NewSession(conn *websocket.Conn, cfg *config.Config) *Session {
 	}
 }
 
-// isLive returns true when both ElevenLabs and OpenRouter API keys are configured,
-// meaning the session can use real STT/LLM/TTS services. Otherwise mock mode is used.
+// isLive returns true when API keys are configured for at least one STT provider
+// and the LLM service, meaning the session can use real STT/LLM/TTS services.
 func (s *Session) isLive() bool {
-	return s.cfg != nil && s.cfg.ElevenLabsKey != "" && s.cfg.OpenRouterKey != ""
+	if s.cfg == nil || s.cfg.OpenRouterKey == "" {
+		return false
+	}
+	// At least one STT provider must have a key
+	return s.cfg.ElevenLabsKey != "" || s.cfg.DeepInfraKey != ""
 }
 
 // isBatchSTT returns true when the client requested batch (non-streaming) STT mode.
@@ -153,11 +157,19 @@ func (s *Session) handleSessionStart(msg ClientMessage) {
 		s.connectSTT()
 	}
 
-	s.logf("session started (live=%v, stt=%v, sttMode=%s)", s.isLive(), s.sttReady, func() string {
+	s.logf("session started (live=%v, stt=%v, sttMode=%s, sttProvider=%s)", s.isLive(), s.sttReady, func() string {
 		if s.isBatchSTT() {
 			return "batch"
 		}
 		return "realtime"
+	}(), func() string {
+		if s.sessionCfg != nil && s.sessionCfg.STTProvider != "" {
+			return s.sessionCfg.STTProvider
+		}
+		if s.cfg != nil {
+			return s.cfg.STTProvider
+		}
+		return "elevenlabs"
 	}())
 	_ = s.sendJSON(ServerMessage{Type: "session.started", SessionID: s.ID})
 }
@@ -282,8 +294,27 @@ batchFallback:
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	sttClient := &stt.ElevenLabsSTT{APIKey: s.cfg.ElevenLabsKey}
-	text, err := sttClient.Transcribe(ctx, pcmData)
+	// Select STT provider: client override > server default > "elevenlabs"
+	provider := "elevenlabs"
+	if s.cfg != nil && s.cfg.STTProvider != "" {
+		provider = s.cfg.STTProvider
+	}
+	if s.sessionCfg != nil && s.sessionCfg.STTProvider != "" {
+		provider = s.sessionCfg.STTProvider
+	}
+
+	var text string
+	var err error
+	switch provider {
+	case "deepinfra":
+		s.logf("batch STT provider: deepinfra")
+		client := &stt.DeepInfraSTT{APIKey: s.cfg.DeepInfraKey}
+		text, err = client.Transcribe(ctx, pcmData)
+	default: // "elevenlabs"
+		s.logf("batch STT provider: elevenlabs")
+		client := &stt.ElevenLabsSTT{APIKey: s.cfg.ElevenLabsKey}
+		text, err = client.Transcribe(ctx, pcmData)
+	}
 	if err != nil {
 		s.logf("batch STT error: %v", err)
 		_ = s.sendJSON(ServerMessage{Type: "error", Code: "stt_failed", Message: err.Error()})

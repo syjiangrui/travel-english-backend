@@ -28,6 +28,7 @@ type SessionConfig struct {
 	TTSVoiceID    string `json:"tts_voice_id,omitempty"`   // ElevenLabs voice ID override
 	STTLanguage   string `json:"stt_language,omitempty"`   // ISO 639-1 code; empty = auto-detect
 	STTMode       string `json:"stt_mode,omitempty"`       // "realtime" (default) or "batch"
+	STTProvider   string `json:"stt_provider,omitempty"`   // "elevenlabs" (default) or "deepinfra"; overrides server default
 }
 
 // HistoryItem represents a single turn in the conversation history,

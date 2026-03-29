@@ -8,12 +8,13 @@
 Flutter Client
     ↓ WebSocket (JSON + Binary)
 Go Backend (本服务)
-    ├── ElevenLabs Realtime STT (WebSocket) — 语音识别
+    ├── ElevenLabs Realtime STT (WebSocket) — 语音识别 (流式)
+    ├── DeepInfra Whisper large-v3 (REST) — 语音识别 (批量, 可选)
     ├── OpenRouter LLM (SSE Streaming) — 对话生成
     └── ElevenLabs TTS (REST → MP3) — 语音合成
 ```
 
-**核心设计**：API Key 全部收归后台，客户端零感知。后台换模型/换 TTS 引擎对客户端无影响。
+**核心设计**：API Key 全部收归后台，客户端零感知。后台换模型/换 TTS/STT 引擎对客户端无影响。
 
 ## 功能
 
@@ -22,6 +23,7 @@ Go Backend (本服务)
 - **全链路流式**：PCM 音频输入 → 流式 ASR → 流式 LLM → 逐句 TTS → MP3 输出
 - **LLM + TTS 并行**：LLM 流式输出同时触发 TTS 合成（goroutine + channel），显著降低端到端延迟
 - **双 STT 模式**：Realtime（WebSocket 流式）/ Batch（REST 录完再识别），可配置
+- **双 STT 引擎**：ElevenLabs（默认）/ DeepInfra Whisper large-v3，环境变量或客户端切换
 - **上下文管理**：最多 40 条消息（20 轮 QA），自动裁剪
 - **Mock 模式**：无 API Key 时返回固定响应，用于协议测试
 
@@ -51,8 +53,10 @@ cp .env.example .env
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PORT` | 8080 | 监听端口 |
-| `ELEVENLABS_API_KEY` | *(必填)* | ElevenLabs STT/TTS |
+| `ELEVENLABS_API_KEY` | *(至少填一个 STT)* | ElevenLabs STT/TTS |
 | `OPENROUTER_API_KEY` | *(必填)* | OpenRouter LLM |
+| `DEEPINFRA_API_KEY` | *(可选)* | DeepInfra Whisper STT |
+| `STT_PROVIDER` | `elevenlabs` | 默认 STT 引擎：`elevenlabs` 或 `deepinfra` |
 | `DEFAULT_MODEL` | `deepseek/deepseek-chat-v3.1` | LLM 模型（中国区可用） |
 | `DEFAULT_VOICE_ID` | `21m00Tcm4TlvDq8ikWAM` | TTS 语音（Rachel） |
 
@@ -80,7 +84,7 @@ go test ./test/ -v
 
 | 类型 | 说明 | 字段 |
 |------|------|------|
-| `session.start` | 初始化会话 | `config: {system_role, speaking_style, tts_voice_id, stt_language, stt_mode}` |
+| `session.start` | 初始化会话 | `config: {system_role, speaking_style, tts_voice_id, stt_language, stt_mode, stt_provider}` |
 | Binary frame | PCM 音频（16kHz/16-bit mono，640字节/20ms） | 原始字节 |
 | `audio.end` | 结束录音，触发 STT→LLM→TTS 链路 | — |
 | `text.query` | 文本输入（跳过 STT） | `text` |
@@ -157,7 +161,8 @@ go test ./test/ -v
 │   ├── session.go             # 核心状态机 + STT→LLM→TTS 管线
 │   └── protocol.go            # JSON 消息类型定义
 ├── stt/
-│   └── elevenlabs.go          # ElevenLabs STT（Realtime WebSocket + Batch REST）
+│   ├── elevenlabs.go          # ElevenLabs STT（Realtime WebSocket + Batch REST）
+│   └── deepinfra.go           # DeepInfra Whisper large-v3（Batch REST, language=zh）
 ├── llm/
 │   ├── openrouter.go          # OpenRouter SSE 流式调用
 │   └── context.go             # 对话历史管理（最多 40 条）

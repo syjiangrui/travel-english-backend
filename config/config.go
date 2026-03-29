@@ -16,6 +16,8 @@ type Config struct {
 	OpenRouterKey  string // OpenRouter API key for LLM chat completions
 	DefaultModel   string // LLM model identifier (default "deepseek/deepseek-chat-v3.1")
 	DefaultVoiceID string // ElevenLabs voice ID for TTS (default "21m00Tcm4TlvDq8ikWAM" = Rachel)
+	DeepInfraKey   string // DeepInfra API key for Whisper STT (optional)
+	STTProvider    string // Default STT provider: "elevenlabs" (default) or "deepinfra"
 }
 
 // Load reads configuration from environment variables, with .env file support.
@@ -30,6 +32,8 @@ func Load() *Config {
 		OpenRouterKey:  getEnv("OPENROUTER_API_KEY", ""),
 		DefaultModel:   getEnv("DEFAULT_MODEL", "deepseek/deepseek-chat-v3.1"),
 		DefaultVoiceID: getEnv("DEFAULT_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
+		DeepInfraKey:   getEnv("DEEPINFRA_API_KEY", ""),
+		STTProvider:    getEnv("STT_PROVIDER", "elevenlabs"),
 	}
 }
 
