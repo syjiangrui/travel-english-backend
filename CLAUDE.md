@@ -157,10 +157,15 @@ Flush()      // 发送剩余缓冲文本
 | 配置项 | 默认值 |
 |--------|--------|
 | Port | 8080 |
-| LLM Model | deepseek/deepseek-chat-v3.1 |
+| LLM Model | google/gemini-3.1-flash-lite-preview (通过 .env DEFAULT_MODEL 配置) |
+| LLM max_tokens | 100 (保持回复简短口语化) |
 | TTS Voice | 21m00Tcm4TlvDq8ikWAM (Rachel) |
 | TTS Model | eleven_multilingual_v2 |
+| TTS previous_text | 自动传递上一句文本，保持语气连贯 |
 | STT Model | scribe_v2_realtime |
+| STT language | 自动检测 (支持中英混说) |
+| STT VAD | vad_threshold=0.5, min_speech=200ms, min_silence=200ms |
+| STT previous_text | 自动传递上一轮 AI 回复，提高识别准确度 |
 | 音频格式 | PCM 16kHz 16-bit mono (输入) / MP3 (输出) |
 | 上下文上限 | 40 条消息 (20 轮 QA) |
 | STT 超时 | commit 10s, batch 30s |

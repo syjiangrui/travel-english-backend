@@ -13,9 +13,13 @@ type ElevenLabsTTS struct {
 	APIKey  string
 	VoiceID string
 	BaseURL string // default "https://api.elevenlabs.io/v1"
+
+	// PreviousText provides context from the preceding sentence for natural prosody continuity.
+	PreviousText string
 }
 
 // Synthesize converts text to MP3 audio bytes.
+// After each call, PreviousText is automatically updated to the synthesized text.
 func (t *ElevenLabsTTS) Synthesize(ctx context.Context, text string) ([]byte, error) {
 	if text == "" {
 		return nil, fmt.Errorf("empty text")
@@ -39,6 +43,9 @@ func (t *ElevenLabsTTS) Synthesize(ctx context.Context, text string) ([]byte, er
 			"similarity_boost": 0.75,
 		},
 	}
+	if t.PreviousText != "" {
+		reqBody["previous_text"] = t.PreviousText
+	}
 	jsonBody, _ := json.Marshal(reqBody)
 
 	url := fmt.Sprintf("%s/text-to-speech/%s", baseURL, voiceID)
@@ -61,5 +68,11 @@ func (t *ElevenLabsTTS) Synthesize(ctx context.Context, text string) ([]byte, er
 		return nil, fmt.Errorf("TTS API error %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	// Update previous_text so the next sentence has prosody continuity
+	t.PreviousText = text
+	return data, nil
 }

@@ -28,6 +28,10 @@ import (
 type RealtimeSTT struct {
 	APIKey string
 
+	// PreviousText provides conversational context to improve transcription accuracy.
+	// Set this to the last assistant response before each new user turn.
+	PreviousText string
+
 	// Callbacks – set before calling Connect()
 	OnPartial   func(text string) // interim transcript (may change)
 	OnCommitted func(text string) // final committed transcript
@@ -70,7 +74,11 @@ func (m *sttServerMsg) errorString() string {
 // Connect opens the ElevenLabs realtime STT WebSocket.
 // language can be "" for auto-detect or an ISO 639-1 code like "en".
 func (r *RealtimeSTT) Connect(ctx context.Context, language string) error {
-	url := "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual&enable_logging=false"
+	url := "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual&enable_logging=false" +
+		"&include_language_detection=true" +
+		"&vad_threshold=0.5" +
+		"&min_speech_duration_ms=200" +
+		"&min_silence_duration_ms=200"
 	if language != "" {
 		url += "&language_code=" + language
 	}
@@ -106,8 +114,11 @@ func (r *RealtimeSTT) SendAudio(pcm []byte) error {
 		return fmt.Errorf("STT not connected")
 	}
 	msg := map[string]interface{}{
-		"message_type": "input_audio_chunk",
+		"message_type":  "input_audio_chunk",
 		"audio_base_64": base64.StdEncoding.EncodeToString(pcm),
+	}
+	if r.PreviousText != "" {
+		msg["previous_text"] = r.PreviousText
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

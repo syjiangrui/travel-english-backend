@@ -32,9 +32,10 @@ func (o *OpenRouterLLM) StreamChat(ctx context.Context, messages []Message, onDe
 	}
 
 	reqBody := map[string]interface{}{
-		"model":    o.Model,
-		"messages": messages,
-		"stream":   true,
+		"model":      o.Model,
+		"messages":   messages,
+		"stream":     true,
+		"max_tokens": 100, // keep replies short and conversational
 	}
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {

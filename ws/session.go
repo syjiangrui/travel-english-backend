@@ -123,6 +123,7 @@ func (s *Session) handleSessionStart(msg ClientMessage) {
 		systemRole = s.sessionCfg.SystemRole
 	}
 	s.ctx = llm.NewContextManager(systemRole)
+	s.logf("session.start config: systemRole=%q (len=%d)", systemRole, len(systemRole))
 
 	// Connect streaming STT if live
 	if s.isLive() {
@@ -154,7 +155,7 @@ func (s *Session) connectSTT() {
 		s.logf("STT error: %v", err)
 	}
 
-	lang := "en"
+	lang := "" // 默认不指定，由 Scribe v2 自动检测语言（支持中英混说）
 	if s.sessionCfg != nil && s.sessionCfg.STTLanguage != "" {
 		lang = s.sessionCfg.STTLanguage
 	}
@@ -332,6 +333,7 @@ func (s *Session) streamLLMWithTTS(userText string) {
 		msgs = append(msgs, llm.Message{Role: "system", Content: s.ctx.SystemRole})
 	}
 	msgs = append(msgs, s.ctx.History...)
+	s.logf("LLM request: %d messages, systemRole=%q", len(msgs), s.ctx.SystemRole)
 
 	llmClient := &llm.OpenRouterLLM{
 		APIKey: s.cfg.OpenRouterKey,
@@ -386,6 +388,10 @@ func (s *Session) streamLLMWithTTS(userText string) {
 	// Update context with assistant response
 	if err == nil && fullResponse != "" {
 		s.ctx.AddAssistantMessage(fullResponse)
+		// Feed last assistant reply to STT as previous_text for better accuracy
+		if s.sttConn != nil {
+			s.sttConn.PreviousText = fullResponse
+		}
 	} else if err != nil {
 		s.logf("LLM error: %v", err)
 		_ = s.sendJSON(ServerMessage{Type: "error", Code: "llm_failed", Message: err.Error()})
