@@ -220,6 +220,9 @@ func (s *Session) handleAudioEnd() {
 		// Wait for committed transcript
 		select {
 		case finalText := <-committedCh:
+			// Clear buffer — realtime succeeded, no need for batch fallback data
+			s.audioBuffer = s.audioBuffer[:0]
+
 			if strings.TrimSpace(finalText) == "" {
 				_ = s.sendJSON(ServerMessage{Type: "error", Code: "stt_empty", Message: "No speech detected"})
 				return
