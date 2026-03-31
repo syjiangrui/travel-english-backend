@@ -13,6 +13,7 @@ import (
 	"travel-english-backend/evaluate"
 	"travel-english-backend/hint"
 	"travel-english-backend/memory"
+	"travel-english-backend/translate"
 	"travel-english-backend/ws"
 )
 
@@ -23,6 +24,7 @@ func main() {
 	http.HandleFunc("/hint", hint.HandleHint(cfg))
 	http.HandleFunc("/evaluate", evaluate.HandleEvaluate(cfg))
 	http.HandleFunc("/memory", memory.HandleMemory(cfg))
+	http.HandleFunc("/translate", translate.HandleTranslate(cfg))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
