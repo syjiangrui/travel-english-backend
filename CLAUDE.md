@@ -21,7 +21,7 @@ wscat -c ws://localhost:8080/ws
 
 ## Architecture
 
-Go 后台服务，替代火山引擎 S2S 直连，串联 STT → OpenRouter LLM (streaming) → ElevenLabs TTS。Flutter 客户端只连此后台 WebSocket，API key 全部收归后台管理。
+Go 后台服务，替代火山引擎 S2S 直连，串联 STT → OpenRouter LLM (streaming) → ElevenLabs TTS。Flutter 客户端只连此后台 WebSocket，API key 全部收归后台管理。另提供 3 个 REST API 端点供不同功能使用。
 
 ### STT 引擎
 
@@ -42,17 +42,19 @@ Go 后台服务，替代火山引擎 S2S 直连，串联 STT → OpenRouter LLM 
 
 ```
 travel-english-backend/
-├── main.go                   // HTTP server: /ws (WebSocket) + /health + /hint (REST)
+├── main.go                   // HTTP server: /ws + /hint + /evaluate + /memory + /health
 ├── config/config.go          // 环境变量加载 (.env → Config struct)
 ├── hint/handler.go           // POST /hint: 空闲引导提示 (LLM 生成上下文引导语)
+├── evaluate/handler.go       // POST /evaluate: 对话质量评价 (评分+纠正+反馈)
+├── memory/handler.go         // POST /memory: 长期记忆提取 (temperature:0.1, max_tokens:300)
 ├── ws/
 │   ├── handler.go            // WebSocket upgrade + read loop (text/binary 路由)
-│   ├── session.go            // 会话状态 + 消息路由 + pipeline 编排 (核心)
+│   ├── session.go            // 会话状态 + 消息路由 + pipeline 编排 + session.update (核心)
 │   └── protocol.go           // JSON 消息类型定义 (ClientMessage/ServerMessage)
 ├── stt/elevenlabs.go         // ElevenLabs STT: 实时 WebSocket + batch REST fallback
 ├── stt/deepinfra.go          // DeepInfra Whisper large-v3 batch STT (language=zh)
 ├── llm/
-│   ├── openrouter.go         // OpenRouter SSE streaming (OpenAI 兼容格式)
+│   ├── openrouter.go         // OpenRouter SSE streaming (支持 MaxTokens/Temperature 可选参数)
 │   └── context.go            // 对话历史管理 (max 40 条, 自动 trim)
 ├── tts/
 │   ├── elevenlabs.go         // ElevenLabs TTS: POST → MP3 bytes
@@ -94,6 +96,7 @@ WebSocket 原生帧类型区分：Text frame = JSON 控制消息，Binary frame 
 | type | 说明 | 额外字段 |
 |------|------|---------|
 | `session.start` | 建立会话，初始化 STT/Context | `config: {system_role, speaking_style, tts_voice_id, stt_language, stt_mode, stt_provider}` |
+| `session.update` | 中途更新 session 配置（不断连重连） | `config: {system_role}` — 直接更新 ContextManager.SystemRole |
 | *(binary frame)* | PCM 音频块 (16kHz 16bit mono) | 服务端实时转发给 ElevenLabs STT |
 | `audio.end` | 录音结束，commit STT → 触发 LLM→TTS 链 | — |
 | `text.query` | 文本输入 (跳过 STT，直接进 LLM) | `text` |
@@ -127,6 +130,7 @@ Port, ElevenLabsKey, OpenRouterKey, DefaultModel, DefaultVoiceID, DeepInfraKey, 
 sendJSON(v) / sendBinary(data)     // 线程安全写入 (mu sync.Mutex)
 HandleMessage(raw) / HandleBinary(data)  // 读 loop 路由
 handleSessionStart → connectSTT    // 初始化 + 连接实时 STT
+handleSessionUpdate                // 中途更新 system_role (不断连)
 handleAudioEnd → streamLLMWithTTS  // 核心 pipeline (realtime commit 或 batch REST)
 handleTextQuery → streamLLMWithTTS // 文本输入路径
 handleTTSSynthesize                // 独立 TTS 请求
@@ -159,12 +163,15 @@ Transcribe(ctx, pcmAudio) → text  // multipart POST, PCM→WAV, language=zh, t
 ```
 StreamChat(ctx, messages, onDelta) → (fullResponse, err)
 // SSE 解析, OpenAI 兼容格式, 累积完整回复
+// MaxTokens: 0 = default (100), 可自定义 (e.g. 300 for memory extraction)
+// Temperature: 0 = omit (API default), >0 = include in request
 ```
 
 ### llm.ContextManager
 ```
 AddUserMessage(text) / AddAssistantMessage(text)  // 自动 trim 到 40 条
 SetHistory(items) / BuildMessages(userText)
+SystemRole  // 可通过 session.update 中途更新
 ```
 
 ### tts.ElevenLabsTTS
@@ -179,13 +186,23 @@ Flush()      // 发送剩余缓冲文本
 // 边界: ". " "! " "? " ".\n" "!\n" "?\n" "。" "！" "？"
 ```
 
+### memory.HandleMemory (POST /memory)
+```
+// 请求: {"messages": [{role, text}]}
+// LLM: system prompt (记忆总结助手) + user (对话历史)
+// 参数: temperature=0.1, max_tokens=300
+// 解析: 正则 \[.*\] → JSON parse → fallback 空数组
+// 响应: {"memories": ["...", "..."]}
+```
+
 ## 默认配置
 
 | 配置项 | 默认值 |
 |--------|--------|
 | Port | 8080 |
 | LLM Model | google/gemini-3.1-flash-lite-preview (通过 .env DEFAULT_MODEL 配置) |
-| LLM max_tokens | 100 (保持回复简短口语化) |
+| LLM max_tokens | 100 (对话, 默认) / 300 (记忆提取, handler 覆盖) |
+| LLM temperature | API default (对话) / 0.1 (记忆提取, 稳定 JSON 输出) |
 | TTS Voice | 21m00Tcm4TlvDq8ikWAM (Rachel) |
 | TTS Model | eleven_multilingual_v2 |
 | TTS previous_text | 自动传递上一句文本，保持语气连贯 |
@@ -197,6 +214,7 @@ Flush()      // 发送剩余缓冲文本
 | 上下文上限 | 40 条消息 (20 轮 QA) |
 | STT 超时 | commit 10s, batch 30s |
 | LLM 超时 | 60s |
+| Hint/Evaluate/Memory 超时 | 10s |
 
 ## 测试
 
@@ -213,4 +231,9 @@ Flush()      // 发送剩余缓冲文本
 Flutter 客户端通过 `BackendConversationService` (lib/services/backend_conversation_service.dart) 连接此后台：
 - 发送: JSON text frame + PCM binary frame
 - 接收: JSON 控制消息 + MP3 binary frame (队列逐句播放)
+- `sendSessionUpdate(systemRole:)`: 发送 `session.update` 消息中途刷新 system_role
 - 后台换模型/换 TTS 引擎对客户端零影响
+
+BingoScreen 通过 `BingoMemoryService` 调用 `POST /memory`：
+- 每 2 轮 AI 回复后触发，发送最近 4 条消息
+- 返回的记忆数组存入本地 + 通过 `session.update` 刷新 server 端 system_role

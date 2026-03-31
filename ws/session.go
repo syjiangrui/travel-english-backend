@@ -96,6 +96,8 @@ func (s *Session) HandleMessage(raw []byte) {
 	switch msg.Type {
 	case "session.start":
 		s.handleSessionStart(msg)
+	case "session.update":
+		s.handleSessionUpdate(msg)
 	case "audio.end":
 		go s.handleAudioEnd()
 	case "text.query":
@@ -172,6 +174,25 @@ func (s *Session) handleSessionStart(msg ClientMessage) {
 		return "elevenlabs"
 	}())
 	_ = s.sendJSON(ServerMessage{Type: "session.started", SessionID: s.ID})
+}
+
+// handleSessionUpdate updates session configuration mid-session without
+// requiring a full reconnect. Currently supports updating the system_role
+// (e.g., after memory extraction adds new memories to the system prompt).
+func (s *Session) handleSessionUpdate(msg ClientMessage) {
+	if s.ctx == nil {
+		s.logf("session.update: no active session, ignoring")
+		return
+	}
+	if msg.Config == nil {
+		s.logf("session.update: no config provided, ignoring")
+		return
+	}
+	if msg.Config.SystemRole != "" {
+		old := s.ctx.SystemRole
+		s.ctx.SystemRole = msg.Config.SystemRole
+		s.logf("session.update: systemRole updated (old=%d chars, new=%d chars)", len(old), len(msg.Config.SystemRole))
+	}
 }
 
 // connectSTT opens the ElevenLabs realtime STT WebSocket.

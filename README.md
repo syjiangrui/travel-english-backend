@@ -1,6 +1,6 @@
 # Travel English Backend
 
-旅行英语口语练习 App 的 Go 后台服务，串联 STT → LLM → TTS 全链路，Flutter 客户端只需连接一个 WebSocket。
+旅行英语口语练习 App 的 Go 后台服务，串联 STT → LLM → TTS 全链路，Flutter 客户端只需连接一个 WebSocket。同时提供 REST API 供空闲引导、对话评价和记忆提取功能使用。
 
 ## 架构概览
 
@@ -12,6 +12,13 @@ Go Backend (本服务)
     ├── DeepInfra Whisper large-v3 (REST) — 语音识别 (批量, 可选)
     ├── OpenRouter LLM (SSE Streaming) — 对话生成
     └── ElevenLabs TTS (REST → MP3) — 语音合成
+
+Flutter Client
+    ↓ HTTP REST
+Go Backend
+    ├── POST /hint     — 空闲引导提示 (ChatScreen)
+    ├── POST /evaluate — 对话质量评价 (ChatScreen)
+    └── POST /memory   — 长期记忆提取 (BingoScreen)
 ```
 
 **核心设计**：API Key 全部收归后台，客户端零感知。后台换模型/换 TTS/STT 引擎对客户端无影响。
@@ -25,16 +32,18 @@ Go Backend (本服务)
 - **双 STT 模式**：Realtime（WebSocket 流式）/ Batch（REST 录完再识别），可配置
 - **双 STT 引擎**：ElevenLabs（默认）/ DeepInfra Whisper large-v3，环境变量或客户端切换
 - **上下文管理**：最多 40 条消息（20 轮 QA），自动裁剪
+- **session.update**：支持中途更新 system_role（用于记忆提取后刷新 system prompt，无需断连重连）
 - **Mock 模式**：无 API Key 时返回固定响应，用于协议测试
 
 ### REST API
 
-| 端点 | 方法 | 功能 |
-|------|------|------|
-| `/ws` | GET→WebSocket | 实时对话（STT → LLM → TTS） |
-| `/hint` | POST | 空闲引导提示（LLM 根据上下文生成建议） |
-| `/evaluate` | POST | 对话质量评价（评分 + 纠正 + 反馈） |
-| `/health` | GET | 健康检查 `{"status":"ok"}` |
+| 端点 | 方法 | 功能 | 超时 |
+|------|------|------|------|
+| `/ws` | GET→WebSocket | 实时对话（STT → LLM → TTS） | 60s (LLM) |
+| `/hint` | POST | 空闲引导提示（LLM 根据上下文生成建议） | 10s |
+| `/evaluate` | POST | 对话质量评价（评分 + 纠正 + 反馈） | 10s |
+| `/memory` | POST | 长期记忆提取（从对话中提取用户偏好/事实） | 10s |
+| `/health` | GET | 健康检查 `{"status":"ok"}` | — |
 
 ## 快速开始
 
@@ -85,6 +94,7 @@ go test ./test/ -v
 | 类型 | 说明 | 字段 |
 |------|------|------|
 | `session.start` | 初始化会话 | `config: {system_role, speaking_style, tts_voice_id, stt_language, stt_mode, stt_provider}` |
+| `session.update` | 中途更新 session 配置（不断连） | `config: {system_role}` |
 | Binary frame | PCM 音频（16kHz/16-bit mono，640字节/20ms） | 原始字节 |
 | `audio.end` | 结束录音，触发 STT→LLM→TTS 链路 | — |
 | `text.query` | 文本输入（跳过 STT） | `text` |
@@ -150,6 +160,33 @@ go test ./test/ -v
 }
 ```
 
+### POST /memory
+
+从对话历史中提取用户长期记忆（偏好、事实、个人信息）。BingoScreen 每 2 轮 AI 回复后调用。
+
+```json
+// 请求
+{
+  "messages": [
+    {"role": "user", "text": "我最近在学登山，下周要去爬黄山"},
+    {"role": "assistant", "text": "哇，黄山很棒啊！你之前爬过山吗？"},
+    {"role": "user", "text": "爬过几次，我是个医生，平时工作很忙"},
+    {"role": "assistant", "text": "医生工作确实辛苦，登山是个很好的放松方式"}
+  ]
+}
+
+// 响应
+{
+  "memories": [
+    "用户正在学习登山，计划下周去爬黄山",
+    "用户偏好高海拔的山",
+    "用户的职业是医生，平时工作繁忙"
+  ]
+}
+```
+
+LLM 参数：`temperature: 0.1`（稳定 JSON 输出）、`max_tokens: 300`。解析策略：正则 `\[.*\]` 提取 → 直接 JSON parse → 返回空数组。
+
 ## 项目结构
 
 ```
@@ -158,13 +195,13 @@ go test ./test/ -v
 │   └── config.go              # 环境变量加载（.env 支持）
 ├── ws/
 │   ├── handler.go             # WebSocket 升级 + 读取循环
-│   ├── session.go             # 核心状态机 + STT→LLM→TTS 管线
+│   ├── session.go             # 核心状态机 + STT→LLM→TTS 管线 + session.update
 │   └── protocol.go            # JSON 消息类型定义
 ├── stt/
 │   ├── elevenlabs.go          # ElevenLabs STT（Realtime WebSocket + Batch REST）
 │   └── deepinfra.go           # DeepInfra Whisper large-v3（Batch REST, language=zh）
 ├── llm/
-│   ├── openrouter.go          # OpenRouter SSE 流式调用
+│   ├── openrouter.go          # OpenRouter SSE 流式调用（支持 MaxTokens/Temperature 参数）
 │   └── context.go             # 对话历史管理（最多 40 条）
 ├── tts/
 │   ├── elevenlabs.go          # ElevenLabs TTS（REST → MP3）
@@ -173,6 +210,8 @@ go test ./test/ -v
 │   └── handler.go             # POST /hint 空闲引导
 ├── evaluate/
 │   └── handler.go             # POST /evaluate 对话评价
+├── memory/
+│   └── handler.go             # POST /memory 记忆提取
 ├── test/
 │   └── ws_integration_test.go # 集成测试（6 个用例）
 ├── .env.example               # 配置模板
@@ -224,10 +263,10 @@ systemctl status travel-english-backend
 |------|-----|
 | 音频输入 | PCM 16kHz 16-bit mono（640字节/20ms） |
 | 音频输出 | MP3（逐句） |
-| LLM max_tokens | 100（保持回复简短） |
+| LLM max_tokens | 100（对话，默认）/ 300（记忆提取） |
+| LLM temperature | API 默认（对话）/ 0.1（记忆提取） |
 | TTS 模型 | eleven_multilingual_v2 |
 | 上下文上限 | 40 条消息（自动裁剪） |
 | STT 超时 | 10s（Realtime）/ 30s（Batch） |
 | LLM 超时 | 60s |
-| Hint 超时 | 10s |
-| Evaluate 超时 | 10s |
+| Hint/Evaluate/Memory 超时 | 10s |

@@ -21,9 +21,11 @@ type Message struct {
 
 // OpenRouterLLM is a client for streaming chat completions via OpenRouter.
 type OpenRouterLLM struct {
-	APIKey  string
-	Model   string // e.g., "deepseek/deepseek-chat-v3.1"
-	BaseURL string // default "https://openrouter.ai/api/v1"
+	APIKey      string
+	Model       string  // e.g., "deepseek/deepseek-chat-v3.1"
+	BaseURL     string  // default "https://openrouter.ai/api/v1"
+	MaxTokens   int     // 0 = use default (100)
+	Temperature float64 // 0 = omit from request (use API default)
 }
 
 // StreamChat sends messages to OpenRouter and streams delta tokens via the onDelta callback.
@@ -35,11 +37,19 @@ func (o *OpenRouterLLM) StreamChat(ctx context.Context, messages []Message, onDe
 		baseURL = "https://openrouter.ai/api/v1"
 	}
 
+	maxTokens := o.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 100 // default: keep replies short and conversational
+	}
+
 	reqBody := map[string]interface{}{
 		"model":      o.Model,
 		"messages":   messages,
 		"stream":     true,
-		"max_tokens": 100, // keep replies short and conversational
+		"max_tokens": maxTokens,
+	}
+	if o.Temperature > 0 {
+		reqBody["temperature"] = o.Temperature
 	}
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {

@@ -8,6 +8,7 @@ package ws
 // ClientMessage is the envelope for all JSON messages sent by the Flutter client.
 // The Type field determines which handler processes the message:
 //   - "session.start"          – initialize a new conversation session
+//   - "session.update"         – update session config mid-session (e.g., system_role after memory extraction)
 //   - "audio.end"              – signal end of audio recording, trigger STT → LLM → TTS pipeline
 //   - "text.query"             – send a text message directly (bypasses STT)
 //   - "tts.synthesize"         – request standalone TTS synthesis (e.g., message replay)
