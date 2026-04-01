@@ -33,6 +33,11 @@ type Session struct {
 	sttConn     *stt.RealtimeSTT // nil when not connected or in batch mode
 	sttReady    bool             // false after first send error to suppress repeated logging
 	audioBuffer [][]byte         // accumulates PCM chunks for batch fallback or mock mode
+
+	// Turn cancellation (barge-in support)
+	currentCancel context.CancelFunc // cancel func for active streamLLMWithTTS; nil when idle
+	cancelGen     int64              // generation counter to avoid stale defer clearing new cancel
+	cancelMu      sync.Mutex         // protects currentCancel and cancelGen
 }
 
 // NewSession creates a session bound to the given WebSocket connection.
@@ -106,6 +111,8 @@ func (s *Session) HandleMessage(raw []byte) {
 		go s.handleTTSSynthesize(msg.Text)
 	case "conversation.history":
 		s.handleConversationHistory(msg.Items)
+	case "turn.cancel":
+		s.handleTurnCancel() // synchronous — must complete before next message is dispatched
 	case "session.end":
 		s.handleSessionEnd()
 	default:
@@ -243,11 +250,15 @@ func (s *Session) connectSTT() {
 // After obtaining the transcript, it feeds it to the LLM → TTS pipeline.
 func (s *Session) handleAudioEnd() {
 	if !s.isLive() {
-		// Mock mode: use buffered audio
 		s.audioBuffer = s.audioBuffer[:0]
 		s.mockAudioEnd()
 		return
 	}
+
+	// Register cancel at the top — covers STT + LLM + TTS phases.
+	// If user barges in during STT, the context is cancelled immediately.
+	ctx, cleanup, turnID := s.registerCancel()
+	defer cleanup()
 
 	// Batch STT mode: skip realtime commit, go directly to batch REST API
 	if s.isBatchSTT() {
@@ -259,9 +270,6 @@ func (s *Session) handleAudioEnd() {
 	if s.sttConn != nil && s.sttConn.IsConnected() {
 		s.logf("audio.end: committing streaming STT")
 
-		// Set up a one-shot channel to bridge the async OnCommitted callback
-		// to this synchronous flow. The channel is buffered(1) so the callback
-		// never blocks even if we've already timed out.
 		committedCh := make(chan string, 1)
 		s.sttConn.OnCommitted = func(text string) {
 			select {
@@ -275,21 +283,30 @@ func (s *Session) handleAudioEnd() {
 			goto batchFallback
 		}
 
-		// Wait for committed transcript
 		select {
 		case finalText := <-committedCh:
-			// Clear buffer — realtime succeeded, no need for batch fallback data
 			s.audioBuffer = s.audioBuffer[:0]
 
 			if strings.TrimSpace(finalText) == "" {
 				_ = s.sendJSON(ServerMessage{Type: "error", Code: "stt_empty", Message: "No speech detected"})
 				return
 			}
+			// Check if cancelled during STT wait
+			if ctx.Err() != nil {
+				s.logf("turn cancelled during STT wait")
+				return
+			}
 			s.logf("STT streaming final: %s", finalText)
 			_ = s.sendJSON(ServerMessage{Type: "asr.result", Text: finalText, IsFinal: BoolPtr(true)})
 
 			s.ctx.AddUserMessage(finalText)
-			s.streamLLMWithTTS(finalText)
+			s.streamLLMWithTTS(ctx, turnID, finalText)
+			return
+
+		case <-ctx.Done():
+			// Cancelled during STT wait
+			s.logf("turn cancelled during STT wait")
+			s.audioBuffer = s.audioBuffer[:0]
 			return
 
 		case <-time.After(10 * time.Second):
@@ -299,7 +316,6 @@ func (s *Session) handleAudioEnd() {
 	}
 
 batchFallback:
-	// Fallback: collect any buffered audio and use batch REST STT
 	var pcmData []byte
 	for _, chunk := range s.audioBuffer {
 		pcmData = append(pcmData, chunk...)
@@ -312,10 +328,12 @@ batchFallback:
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// Check if cancelled before expensive STT API call
+	if ctx.Err() != nil {
+		s.logf("turn cancelled before batch STT")
+		return
+	}
 
-	// Select STT provider: client override > server default > "elevenlabs"
 	provider := "elevenlabs"
 	if s.cfg != nil && s.cfg.STTProvider != "" {
 		provider = s.cfg.STTProvider
@@ -331,12 +349,16 @@ batchFallback:
 		s.logf("batch STT provider: deepinfra")
 		client := &stt.DeepInfraSTT{APIKey: s.cfg.DeepInfraKey}
 		text, err = client.Transcribe(ctx, pcmData)
-	default: // "elevenlabs"
+	default:
 		s.logf("batch STT provider: elevenlabs")
 		client := &stt.ElevenLabsSTT{APIKey: s.cfg.ElevenLabsKey}
 		text, err = client.Transcribe(ctx, pcmData)
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			s.logf("turn cancelled during batch STT")
+			return
+		}
 		s.logf("batch STT error: %v", err)
 		_ = s.sendJSON(ServerMessage{Type: "error", Code: "stt_failed", Message: err.Error()})
 		return
@@ -350,7 +372,7 @@ batchFallback:
 	_ = s.sendJSON(ServerMessage{Type: "asr.result", Text: text, IsFinal: BoolPtr(true)})
 
 	s.ctx.AddUserMessage(text)
-	s.streamLLMWithTTS(text)
+	s.streamLLMWithTTS(ctx, turnID, text)
 }
 
 // handleTextQuery processes a direct text input (no STT needed).
@@ -363,8 +385,11 @@ func (s *Session) handleTextQuery(text string) {
 		return
 	}
 
+	ctx, cleanup, turnID := s.registerCancel()
+	defer cleanup()
+
 	s.ctx.AddUserMessage(text)
-	s.streamLLMWithTTS(text)
+	s.streamLLMWithTTS(ctx, turnID, text)
 }
 
 // handleTTSSynthesize performs standalone text-to-speech without LLM involvement.
@@ -417,6 +442,46 @@ func (s *Session) handleConversationHistory(items []HistoryItem) {
 	s.logf("conversation.history: %d items injected", len(items))
 }
 
+// handleTurnCancel cancels the active pipeline (STT + LLM + TTS) in response
+// to a client barge-in. Runs synchronously on the read-loop goroutine so it
+// completes before the next message (e.g., text.query) is dispatched.
+func (s *Session) handleTurnCancel() {
+	s.cancelMu.Lock()
+	cancel := s.currentCancel
+	s.currentCancel = nil
+	s.cancelMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+		s.logf("turn cancelled by client (barge-in)")
+	}
+	_ = s.sendJSON(ServerMessage{Type: "turn.cancelled"})
+}
+
+// registerCancel creates a cancellable context, registers it as the active
+// pipeline so handleTurnCancel can abort it, and returns ctx + cleanup func.
+// The cleanup func must be deferred by the caller.
+func (s *Session) registerCancel() (context.Context, context.CancelFunc, int64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+
+	s.cancelMu.Lock()
+	s.cancelGen++
+	myGen := s.cancelGen
+	s.currentCancel = cancel
+	s.cancelMu.Unlock()
+
+	cleanup := func() {
+		s.cancelMu.Lock()
+		if s.cancelGen == myGen {
+			s.currentCancel = nil
+		}
+		s.cancelMu.Unlock()
+		cancel()
+	}
+
+	return ctx, cleanup, myGen
+}
+
 // handleSessionEnd tears down the session: closes the STT WebSocket and
 // notifies the client. The main WebSocket connection remains open for potential reuse.
 func (s *Session) handleSessionEnd() {
@@ -437,19 +502,17 @@ func (s *Session) handleSessionEnd() {
 //  3. Each sentence is sent to ElevenLabs TTS in a parallel goroutine
 //  4. TTS MP3 binary frames are sent to the client as they become available
 //
-// This architecture minimizes time-to-first-audio: TTS synthesis begins as
-// soon as the first sentence is complete, without waiting for the full LLM response.
-func (s *Session) streamLLMWithTTS(userText string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
+// The ctx and turnID are provided by the caller (handleAudioEnd/handleTextQuery)
+// who registered the cancel. turnID is echoed in all server messages so the
+// client can filter stale data from cancelled turns.
+func (s *Session) streamLLMWithTTS(ctx context.Context, turnID int64, userText string) {
 	// Build messages from context history (already includes latest user msg)
 	msgs := make([]llm.Message, 0)
 	if s.ctx.SystemRole != "" {
 		msgs = append(msgs, llm.Message{Role: "system", Content: s.ctx.SystemRole})
 	}
-	msgs = append(msgs, s.ctx.History...)
-	s.logf("LLM request: %d messages, systemRole=%q", len(msgs), s.ctx.SystemRole)
+	msgs = append(msgs, s.ctx.HistorySnapshot()...)
+	s.logf("LLM request: %d messages, turnID=%d", len(msgs), turnID)
 
 	llmClient := &llm.OpenRouterLLM{
 		APIKey: s.cfg.OpenRouterKey,
@@ -467,27 +530,42 @@ func (s *Session) streamLLMWithTTS(userText string) {
 			APIKey:  s.cfg.ElevenLabsKey,
 			VoiceID: s.cfg.DefaultVoiceID,
 		}
-		_ = s.sendJSON(ServerMessage{Type: "tts.start"})
+		_ = s.sendJSON(ServerMessage{Type: "tts.start", TurnID: turnID})
 		for sentence := range sentenceCh {
+			if ctx.Err() != nil {
+				for range sentenceCh {
+				}
+				break
+			}
 			s.logf("TTS synthesizing: %s", sentence)
 			mp3Data, err := ttsClient.Synthesize(ctx, sentence)
 			if err != nil {
+				if ctx.Err() != nil {
+					for range sentenceCh {
+					}
+					break
+				}
 				s.logf("TTS error for sentence: %v", err)
 				continue
 			}
 			_ = s.sendBinary(mp3Data)
 		}
-		_ = s.sendJSON(ServerMessage{Type: "tts.end"})
+		if ctx.Err() == nil {
+			_ = s.sendJSON(ServerMessage{Type: "tts.end", TurnID: turnID})
+		}
 	}()
 
-	// Sentence splitter feeds TTS channel
+	// Sentence splitter feeds TTS channel (non-blocking on cancel)
 	splitter := tts.NewSentenceSplitter(func(sentence string) {
-		sentenceCh <- sentence
+		select {
+		case sentenceCh <- sentence:
+		case <-ctx.Done():
+		}
 	})
 
 	// Stream LLM
 	fullResponse, err := llmClient.StreamChat(ctx, msgs, func(delta string) {
-		_ = s.sendJSON(ServerMessage{Type: "chat.delta", Text: delta})
+		_ = s.sendJSON(ServerMessage{Type: "chat.delta", Text: delta, TurnID: turnID})
 		splitter.Feed(delta)
 	})
 
@@ -495,16 +573,20 @@ func (s *Session) streamLLMWithTTS(userText string) {
 	splitter.Flush()
 	close(sentenceCh)
 
-	// Signal chat complete
-	_ = s.sendJSON(ServerMessage{Type: "chat.done"})
+	// Signal chat complete (skip if cancelled — stale turn)
+	if ctx.Err() == nil {
+		_ = s.sendJSON(ServerMessage{Type: "chat.done", TurnID: turnID})
+	}
 
 	// Wait for TTS to finish
 	ttsWg.Wait()
 
 	// Update context with assistant response
-	if err == nil && fullResponse != "" {
+	if ctx.Err() != nil {
+		s.ctx.RemoveLastUserMessage()
+		s.logf("turn cancelled: rolled back user message from context")
+	} else if err == nil && fullResponse != "" {
 		s.ctx.AddAssistantMessage(fullResponse)
-		// Feed last assistant reply to STT as previous_text for better accuracy
 		if s.sttConn != nil {
 			s.sttConn.PreviousText = fullResponse
 		}

@@ -13,6 +13,7 @@ package ws
 //   - "text.query"             – send a text message directly (bypasses STT)
 //   - "tts.synthesize"         – request standalone TTS synthesis (e.g., message replay)
 //   - "conversation.history"   – inject prior conversation context for LLM continuity
+//   - "turn.cancel"            – cancel the active LLM+TTS pipeline (barge-in interrupt)
 //   - "session.end"            – tear down the session and release resources
 type ClientMessage struct {
 	Type      string         `json:"type"`
@@ -48,6 +49,7 @@ type HistoryItem struct {
 //   - "chat.delta"       – streaming LLM token
 //   - "chat.done"        – signals end of LLM response
 //   - "tts.start/end"    – brackets binary MP3 audio frames
+//   - "turn.cancelled"   – confirms active pipeline was cancelled (response to turn.cancel)
 //   - "error"            – error with code and human-readable message
 //   - "session.ended"    – confirms session teardown
 type ServerMessage struct {
@@ -57,6 +59,7 @@ type ServerMessage struct {
 	IsFinal   *bool  `json:"is_final,omitempty"` // used by asr.result to distinguish interim vs final
 	Code      string `json:"code,omitempty"`      // error code (e.g., "stt_failed", "llm_failed")
 	Message   string `json:"message,omitempty"`   // human-readable error description
+	TurnID    int64  `json:"turn_id,omitempty"`   // server-side turn generation; used by client to filter stale barge-in data
 }
 
 // BoolPtr returns a pointer to b, used for the optional IsFinal JSON field.

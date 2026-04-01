@@ -71,13 +71,15 @@ travel-english-backend/
 Client PCM → ElevenLabs Realtime STT (WebSocket)
          → asr.result (partial + final)
          → OpenRouter SSE stream
-         → chat.delta 逐 token 转发客户端
+         → chat.delta 逐 token 转发客户端 (含 turn_id)
          → SentenceSplitter 按句拆分
          → goroutine: 每句 → ElevenLabsTTS.Synthesize() → MP3 binary frame
-         → chat.done + tts.end
+         → chat.done + tts.end (含 turn_id)
 ```
 
 LLM streaming 和 TTS 合成**并行**：goroutine 从 `sentenceCh` channel 消费完整句子，边生成边发。
+
+cancel 注册在 `handleAudioEnd`/`handleTextQuery` 入口（`registerCancel()`），context 覆盖 STT+LLM+TTS 全阶段。`turn.cancel` 可在任一阶段打断。`cancelGen` 作为 `turn_id` 回传客户端，用于过滤旧轮次数据。`ContextManager` 所有方法由 `sync.RWMutex` 保护，`HistorySnapshot()` 返回副本避免 goroutine 间共享切片。
 
 ### Mock/Live 双模式
 
@@ -102,6 +104,7 @@ WebSocket 原生帧类型区分：Text frame = JSON 控制消息，Binary frame 
 | `text.query` | 文本输入 (跳过 STT，直接进 LLM) | `text` |
 | `tts.synthesize` | 纯 TTS 请求 (问候/消息重播) | `text` |
 | `conversation.history` | 注入历史上下文到 ContextManager | `items: [{role, text}]` |
+| `turn.cancel` | 取消当前活跃 pipeline (barge-in 打断) | 同步处理，保证在后续 text.query 前完成 |
 | `session.end` | 结束会话，关闭 STT WebSocket | — |
 
 ### Server → Client
@@ -110,11 +113,12 @@ WebSocket 原生帧类型区分：Text frame = JSON 控制消息，Binary frame 
 |------|------|---------|
 | `session.started` | 会话就绪 | `session_id` |
 | `asr.result` | 语音识别结果 | `text, is_final` (partial: false, final: true) |
-| `chat.delta` | LLM 流式 token | `text` (增量) |
-| `chat.done` | LLM 完成 | — |
-| `tts.start` | TTS 音频即将发送 | — |
+| `chat.delta` | LLM 流式 token | `text` (增量), `turn_id` |
+| `chat.done` | LLM 完成 | `turn_id` |
+| `tts.start` | TTS 音频即将发送 | `turn_id` |
 | *(binary frame)* | MP3 音频块 (按句发送) | — |
-| `tts.end` | TTS 全部发送完毕 | — |
+| `tts.end` | TTS 全部发送完毕 | `turn_id` |
+| `turn.cancelled` | 确认 pipeline 已取消 (响应 turn.cancel) | — |
 | `error` | 错误 | `code, message` |
 
 ## 关键类型与方法
@@ -131,9 +135,11 @@ sendJSON(v) / sendBinary(data)     // 线程安全写入 (mu sync.Mutex)
 HandleMessage(raw) / HandleBinary(data)  // 读 loop 路由
 handleSessionStart → connectSTT    // 初始化 + 连接实时 STT
 handleSessionUpdate                // 中途更新 system_role (不断连)
-handleAudioEnd → streamLLMWithTTS  // 核心 pipeline (realtime commit 或 batch REST)
-handleTextQuery → streamLLMWithTTS // 文本输入路径
+handleAudioEnd → registerCancel → STT → streamLLMWithTTS  // 核心 pipeline，cancel 从入口覆盖
+handleTextQuery → registerCancel → streamLLMWithTTS       // 文本输入路径
+handleTurnCancel                   // barge-in: 同步取消 currentCancel, 发 turn.cancelled
 handleTTSSynthesize                // 独立 TTS 请求
+registerCancel() → (ctx, cleanup, turnID)  // 注册 cancel + 分配 turnID (cancelGen)
 isLive()                           // API key 是否配置
 isBatchSTT()                       // stt_mode == "batch"
 ```
