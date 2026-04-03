@@ -88,7 +88,7 @@ func (s *Session) logf(format string, args ...interface{}) {
 }
 
 // HandleMessage parses a JSON text frame and dispatches to the appropriate handler.
-// Long-running handlers (audio.end, text.query, tts.synthesize) run in separate
+// Long-running handlers (audio.end, text.query, standalone tts) run in separate
 // goroutines so the read loop is not blocked.
 func (s *Session) HandleMessage(raw []byte) {
 	var msg ClientMessage
@@ -108,6 +108,8 @@ func (s *Session) HandleMessage(raw []byte) {
 	case "text.query":
 		go s.handleTextQuery(msg.Text)
 	case "tts.synthesize":
+		go s.handleTTSSynthesize(msg.Text)
+	case "tts.synthesize.full":
 		go s.handleTTSSynthesize(msg.Text)
 	case "conversation.history":
 		s.handleConversationHistory(msg.Items)

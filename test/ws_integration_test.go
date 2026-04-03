@@ -1,13 +1,16 @@
 package test
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"travel-english-backend/tts"
 	"travel-english-backend/ws"
 
 	"github.com/gorilla/websocket"
@@ -18,6 +21,7 @@ func setupServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", ws.Handler)
+	mux.HandleFunc("/tts", tts.HandleSynthesize(nil))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -261,6 +265,57 @@ func TestTtsSynthesize(t *testing.T) {
 	msg = readJSON(t, conn)
 	if msg.Type != "tts.end" {
 		t.Fatalf("expected tts.end, got %s", msg.Type)
+	}
+}
+
+func TestTtsSynthesizeFullAlias(t *testing.T) {
+	server, wsURL := setupServer(t)
+	defer server.Close()
+	conn := dial(t, wsURL)
+	defer conn.Close()
+
+	startSession(t, conn)
+
+	sendJSON(t, conn, map[string]string{"type": "tts.synthesize.full", "text": "Welcome!"})
+
+	msg := readJSON(t, conn)
+	if msg.Type != "tts.start" {
+		t.Fatalf("expected tts.start, got %s", msg.Type)
+	}
+	binData := readBinary(t, conn)
+	if len(binData) != 1024 {
+		t.Fatalf("expected 1024 bytes dummy MP3, got %d", len(binData))
+	}
+	msg = readJSON(t, conn)
+	if msg.Type != "tts.end" {
+		t.Fatalf("expected tts.end, got %s", msg.Type)
+	}
+}
+
+func TestTtsHttpEndpoint(t *testing.T) {
+	server, _ := setupServer(t)
+	defer server.Close()
+
+	body := bytes.NewBufferString(`{"text":"Please repeat after me."}`)
+	resp, err := http.Post(server.URL+"/tts", "application/json", body)
+	if err != nil {
+		t.Fatalf("tts request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if contentType := resp.Header.Get("Content-Type"); contentType != "audio/mpeg" {
+		t.Fatalf("expected audio/mpeg content type, got %q", contentType)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body failed: %v", err)
+	}
+	if len(data) != 1024 {
+		t.Fatalf("expected 1024 bytes dummy MP3, got %d", len(data))
 	}
 }
 

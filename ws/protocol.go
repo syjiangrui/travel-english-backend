@@ -12,6 +12,7 @@ package ws
 //   - "audio.end"              – signal end of audio recording, trigger STT → LLM → TTS pipeline
 //   - "text.query"             – send a text message directly (bypasses STT)
 //   - "tts.synthesize"         – request standalone TTS synthesis (e.g., message replay)
+//   - "tts.synthesize.full"    – alias for standalone TTS synthesis
 //   - "conversation.history"   – inject prior conversation context for LLM continuity
 //   - "turn.cancel"            – cancel the active LLM+TTS pipeline (barge-in interrupt)
 //   - "session.end"            – tear down the session and release resources
@@ -57,9 +58,9 @@ type ServerMessage struct {
 	SessionID string `json:"session_id,omitempty"`
 	Text      string `json:"text,omitempty"`
 	IsFinal   *bool  `json:"is_final,omitempty"` // used by asr.result to distinguish interim vs final
-	Code      string `json:"code,omitempty"`      // error code (e.g., "stt_failed", "llm_failed")
-	Message   string `json:"message,omitempty"`   // human-readable error description
-	TurnID    int64  `json:"turn_id,omitempty"`   // server-side turn generation; used by client to filter stale barge-in data
+	Code      string `json:"code,omitempty"`     // error code (e.g., "stt_failed", "llm_failed")
+	Message   string `json:"message,omitempty"`  // human-readable error description
+	TurnID    int64  `json:"turn_id,omitempty"`  // server-side turn generation; used by client to filter stale barge-in data
 }
 
 // BoolPtr returns a pointer to b, used for the optional IsFinal JSON field.
